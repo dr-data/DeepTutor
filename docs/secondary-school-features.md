@@ -237,3 +237,262 @@ These current DeepTutor capabilities map directly to school use cases:
 ## Summary
 
 The 13 features above transform DeepTutor from a **personal AI learning tool** into a **school-ready learning management system (LMS) with AI superpowers**. The critical insight is that secondary schools need **structure** (roles, assignments, grades, schedules) and **safety** (content filtering, audit trails, guardrails) wrapped around the existing AI capabilities. The AI tutoring is already excellent — the gap is the institutional scaffolding that makes it deployable in a classroom of 30+ students with a teacher who needs oversight and control.
+
+---
+
+## Implementation & Deployment Strategy
+
+### Current Architecture (Limitations)
+
+DeepTutor today runs as a **single-user, single-instance** application:
+
+- **Database**: SQLite file (`data/user/chat_history.db`) — no multi-user support
+- **Auth**: None — all API endpoints are open (`allow_origins=["*"]`)
+- **Isolation**: Zero — any API call can access any session or knowledge base
+- **Config**: Global YAML files (`main.yaml`, `agents.yaml`) — one config for all
+- **LLM**: Requires cloud API keys (OpenAI, Anthropic, etc.)
+- **Deployment**: Single Docker container with supervisord running FastAPI + Next.js
+
+For schools, this needs to change. Below is a strategy that is **simple to start**, **easy to scale**, and **supports offline deployment**.
+
+---
+
+### Recommended Approach: "School-in-a-Box" Appliance
+
+The simplest, most school-friendly model: **one self-contained Docker deployment per school** that includes everything — app, database, LLM, and embeddings — with no internet required.
+
+#### Phase 1: Single-School Deployment (Simple)
+
+```
+┌─────────────────────────────────────────────────────┐
+│  School Server (Docker Compose)                     │
+│                                                     │
+│  ┌──────────────┐  ┌──────────────┐                 │
+│  │  DeepTutor   │  │   Ollama     │                 │
+│  │  (FastAPI +  │──│  (Local LLM  │                 │
+│  │   Next.js)   │  │  + Embedding)│                 │
+│  └──────┬───────┘  └──────────────┘                 │
+│         │                                           │
+│  ┌──────┴───────┐                                   │
+│  │  PostgreSQL  │  (replaces SQLite)                │
+│  │  (single     │                                   │
+│  │   instance)  │                                   │
+│  └──────────────┘                                   │
+│                                                     │
+│  Volume: /data/knowledge_bases                      │
+│  Volume: /data/user                                 │
+└─────────────────────────────────────────────────────┘
+```
+
+**What changes from current architecture:**
+
+1. **Add PostgreSQL** — replace SQLite for multi-user concurrency
+   - Add `user_id` and `school_id` columns to all existing tables
+   - Use SQLAlchemy or raw asyncpg (keep it simple, match current raw-SQL style)
+   - Migration: one-time script to convert existing SQLite schema
+
+2. **Add lightweight JWT auth** — minimal, no external dependency
+   - New tables: `users` (id, email, name, role, hashed_password, school_id), `schools`, `classrooms`
+   - FastAPI middleware: decode JWT on every request, inject `current_user` into request state
+   - Login endpoint: email + password → JWT token
+   - Student onboarding: teacher generates class invite code → student signs up with code
+
+3. **Add Ollama for offline LLM** — already supported via `LLM_BINDING=ollama`
+   - Bundle Ollama container in docker-compose with a pre-downloaded model
+   - Recommended models for school use:
+     - LLM: `qwen2.5:14b` or `llama3.1:8b` (good quality, runs on modest GPU)
+     - Embedding: `nomic-embed-text` or `bge-large-en-v1.5`
+   - For schools with no GPU: `qwen2.5:7b` with CPU-only (slower but functional)
+
+4. **Add RBAC middleware** — simple role check on each endpoint
+   - Three roles: `admin`, `teacher`, `student`
+   - Decorators: `@require_role("teacher")` on assignment/dashboard endpoints
+   - Students can only access their own sessions, assigned knowledge bases
+   - Teachers can access all student data within their classrooms
+
+**docker-compose.school.yml** (conceptual):
+```yaml
+services:
+  deeptutor:
+    image: ghcr.io/hkuds/deeptutor:school
+    depends_on: [postgres, ollama]
+    environment:
+      - DATABASE_URL=postgresql://deeptutor:pass@postgres:5432/deeptutor
+      - LLM_BINDING=ollama
+      - LLM_HOST=http://ollama:11434
+      - LLM_MODEL=qwen2.5:14b
+      - EMBEDDING_BINDING=ollama
+      - EMBEDDING_HOST=http://ollama:11434
+      - EMBEDDING_MODEL=nomic-embed-text
+      - JWT_SECRET=${JWT_SECRET}
+      - SCHOOL_MODE=true
+    volumes:
+      - ./data:/app/data
+
+  postgres:
+    image: postgres:16-alpine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]  # optional, works without GPU too
+
+volumes:
+  pgdata:
+  ollama_models:
+```
+
+**Offline setup for IT staff:**
+```bash
+# 1. On a machine WITH internet, pull everything
+docker compose -f docker-compose.school.yml pull
+docker save deeptutor postgres ollama > deeptutor-school.tar
+
+# 2. Also download the LLM model
+docker run ollama/ollama pull qwen2.5:14b
+docker run ollama/ollama pull nomic-embed-text
+
+# 3. Transfer deeptutor-school.tar + ollama models to school server via USB
+
+# 4. On the school server (no internet needed)
+docker load < deeptutor-school.tar
+docker compose -f docker-compose.school.yml up -d
+```
+
+---
+
+#### Phase 2: District / Multi-School Scale-Up
+
+When a school district wants to manage multiple schools, add a **thin orchestration layer** on top of the same architecture:
+
+```
+┌────────────────────────────────────────────┐
+│  District Management Portal                │
+│  (Admin dashboard for all schools)         │
+└───────┬────────────┬───────────┬───────────┘
+        │            │           │
+   ┌────┴───┐  ┌────┴───┐  ┌───┴────┐
+   │School A│  │School B│  │School C│
+   │(Docker)│  │(Docker)│  │(Docker)│
+   └────────┘  └────────┘  └────────┘
+   (on-prem)   (on-prem)   (cloud)
+```
+
+**Two scaling strategies:**
+
+| Strategy | When to use | How |
+|----------|------------|-----|
+| **Shared PostgreSQL** | Schools on same network / cloud | All schools share one PostgreSQL, isolated by `school_id` column. Single DeepTutor instance serves all. |
+| **Instance-per-school** | Offline schools, data sovereignty | Each school gets its own Docker Compose stack. District portal connects to each via VPN/API. |
+
+**For most secondary schools, instance-per-school is better** because:
+- Schools often have their own servers and IT policies
+- Offline capability per school
+- No single point of failure
+- Data stays physically within the school (privacy regulations)
+- Simple: if one school's instance breaks, others are unaffected
+
+---
+
+#### Phase 3: Cloud Hybrid (Optional)
+
+For schools that want cloud benefits + offline resilience:
+
+```
+┌─────────────────────┐     ┌──────────────────┐
+│  Cloud (optional)   │     │  School Server   │
+│                     │     │  (always works)  │
+│  - Shared models    │◄───►│  - Local Ollama  │
+│  - Central analytics│sync │  - Local Postgres │
+│  - Backup storage   │     │  - Full DeepTutor│
+└─────────────────────┘     └──────────────────┘
+```
+
+- School runs fully offline by default
+- When internet is available, syncs analytics/backups to cloud
+- Cloud provides: model updates, curriculum template distribution, cross-school analytics
+- School works 100% without cloud — cloud is optional enhancement
+
+---
+
+### Implementation Roadmap (Phased)
+
+#### Sprint 1 (2-3 weeks): Auth + Multi-User Foundation
+**Files to modify:**
+- `deeptutor/api/main.py` — add auth middleware
+- `deeptutor/services/session/sqlite_store.py` — add user_id filtering (or replace with PostgreSQL)
+- New: `deeptutor/api/auth/` — JWT auth module (login, register, invite codes)
+- New: `deeptutor/db/models.py` — user, school, classroom tables
+- `web/` — add login page, role-based nav hiding
+
+**Keep it simple:**
+- Use `python-jose` for JWT, `passlib` for password hashing
+- Add `user_id` to existing session queries (WHERE clause)
+- PostgreSQL via `asyncpg` (raw SQL, matching existing style)
+- Frontend: simple login form → store JWT in httpOnly cookie
+
+#### Sprint 2 (2-3 weeks): Teacher Dashboard + Classroom Grid
+**Files to modify:**
+- New: `web/app/(workspace)/classroom/` — classroom grid page
+- New: `deeptutor/api/routers/classroom.py` — student activity endpoints
+- Modify: WebSocket in `deeptutor/api/routers/unified_ws.py` — broadcast student events to teacher
+- New: `web/components/classroom/StudentGrid.tsx` — real-time tile grid
+
+**Architecture:**
+- Teacher opens classroom grid → WebSocket subscribes to all student sessions in that class
+- Each student tile shows last message + status (via existing EventBus)
+- Click tile → full session history (reuse existing `ChatMessages.tsx`)
+
+#### Sprint 3 (2-3 weeks): Assignments + Enhanced Quizzes
+**Files to modify:**
+- New: `deeptutor/db/assignments.py` — assignment CRUD
+- New: `deeptutor/api/routers/assignments.py` — create, submit, grade endpoints
+- Modify: `web/components/quiz/` — add timed mode, teacher review
+- New: `web/app/(workspace)/assignments/` — assignment list + submission UI
+
+**Leverage existing:**
+- Quiz generation already works → add teacher approval + grading layer
+- Guided Learning already works → wrap in assignment context with due dates
+- Co-Writer already works → add submission endpoint
+
+#### Sprint 4 (1-2 weeks): Content Safety + Offline Deployment
+**Files to modify:**
+- New: `deeptutor/services/safety/` — content filter middleware
+- Modify: `deeptutor/api/main.py` — add safety middleware to LLM response pipeline
+- New: `docker-compose.school.yml` — school deployment with Ollama + PostgreSQL
+- New: `scripts/offline-setup.sh` — offline installation script
+
+---
+
+### Hardware Recommendations for Schools
+
+| Setup | Hardware | Students | LLM Quality |
+|-------|----------|----------|-------------|
+| **Minimal** (CPU only) | Any modern PC, 16GB RAM | 5-10 concurrent | Basic (7B model, slow) |
+| **Recommended** | Server with 1x RTX 3060/4060 (12GB VRAM), 32GB RAM | 20-30 concurrent | Good (14B model) |
+| **Optimal** | Server with 1x RTX 3090/4090 (24GB VRAM), 64GB RAM | 40-60 concurrent | Excellent (32B model) |
+| **Cloud hybrid** | Minimal local + cloud LLM API | Unlimited | Best (GPT-4o / Claude) |
+
+**Cheapest offline option:** A single mini-PC with a consumer GPU (RTX 4060, ~$300) can serve a classroom of 30 students running `qwen2.5:14b` through Ollama. Total hardware cost: ~$800-1200.
+
+---
+
+### Technology Decisions Summary
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| **Database** | PostgreSQL (replace SQLite) | Multi-user concurrency, scales to district level, battle-tested |
+| **Auth** | JWT + bcrypt (self-contained) | No external IdP needed, works offline, simple |
+| **LLM (offline)** | Ollama + Qwen 2.5 / Llama 3.1 | Free, fast, good quality, already supported |
+| **LLM (cloud)** | Keep existing multi-provider | OpenAI/Anthropic/etc. for schools with budget + internet |
+| **Embedding (offline)** | Ollama + nomic-embed-text | Good quality, runs on CPU, no API key needed |
+| **Deployment** | Docker Compose (all-in-one) | Simple for school IT staff, portable, offline-friendly |
+| **Scaling** | Instance-per-school | Data sovereignty, offline support, fault isolation |
+| **Real-time** | Existing WebSocket + EventBus | Already built for chat streaming, extend for classroom grid |
