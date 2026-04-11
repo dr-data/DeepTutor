@@ -496,3 +496,279 @@ For schools that want cloud benefits + offline resilience:
 | **Deployment** | Docker Compose (all-in-one) | Simple for school IT staff, portable, offline-friendly |
 | **Scaling** | Instance-per-school | Data sovereignty, offline support, fault isolation |
 | **Real-time** | Existing WebSocket + EventBus | Already built for chat streaming, extend for classroom grid |
+
+---
+
+### Database Backup, Migration & Updates
+
+Schools cannot afford data loss — student records, grades, and learning progress are critical. The current codebase has **no formal migration system, no schema versioning, and no backup mechanism**. Here is the strategy to fix that.
+
+#### Current State (Problems)
+
+| Area | Current Approach | Problem |
+|------|-----------------|---------|
+| Schema init | `CREATE TABLE IF NOT EXISTS` in `sqlite_store.py` | No versioning — can't track what schema a school is running |
+| Schema changes | Manual `ALTER TABLE` check for new columns | Doesn't scale — each new column requires hand-written detection code |
+| Backups | None | A crashed SQLite file = total data loss |
+| Updates | Rebuild Docker image | No way to update app without risking data |
+| Data migration | Ad-hoc scripts (`migrate_user_data.py`, `migrate_kb.py`) | One-time scripts, no rollback, no version tracking |
+
+#### Solution: Alembic + pg_dump + Versioned Updates
+
+##### 1. Schema Migrations with Alembic
+
+Use [Alembic](https://alembic.sqlalchemy.org/) (the standard Python migration tool) for all schema changes. It works with both SQLite and PostgreSQL — so it covers single-user dev and school deployments.
+
+```
+deeptutor/
+├── alembic/
+│   ├── alembic.ini
+│   ├── env.py
+│   └── versions/
+│       ├── 001_initial_schema.py          # Current 4-table schema
+│       ├── 002_add_users_and_roles.py     # Auth tables
+│       ├── 003_add_classrooms.py          # Classroom management
+│       ├── 004_add_assignments.py         # Assignment system
+│       └── ...
+```
+
+**How it works for school IT staff:**
+
+```bash
+# Check current schema version
+docker exec deeptutor alembic current
+
+# Apply all pending migrations (after pulling a new Docker image)
+docker exec deeptutor alembic upgrade head
+
+# Rollback the last migration if something breaks
+docker exec deeptutor alembic downgrade -1
+```
+
+**Key principle:** Every schema change ships as an Alembic migration. The app checks on startup that migrations are current and refuses to start if not (with a clear error message telling IT staff to run the upgrade command).
+
+**Auto-migrate on container start (recommended for schools):**
+
+Add to `entrypoint.sh`:
+```bash
+echo "Checking database migrations..."
+alembic upgrade head || {
+    echo "ERROR: Database migration failed. Please contact support."
+    exit 1
+}
+```
+
+This way, schools just pull the new Docker image and restart — migrations run automatically.
+
+##### 2. Automated Backups
+
+**Daily automated backup** via a sidecar container or cron job inside the main container:
+
+```yaml
+# In docker-compose.school.yml
+services:
+  backup:
+    image: prodrigestivill/postgres-backup-local
+    depends_on: [postgres]
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=deeptutor
+      - POSTGRES_USER=deeptutor
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - SCHEDULE=@daily             # Run daily at midnight
+      - BACKUP_KEEP_DAYS=30         # Keep 30 days of backups
+      - BACKUP_KEEP_WEEKS=4         # Keep 4 weekly backups
+      - BACKUP_KEEP_MONTHS=6        # Keep 6 monthly backups
+    volumes:
+      - ./backups:/backups          # Backups stored on school server
+```
+
+**What gets backed up:**
+
+| Data | Method | Frequency |
+|------|--------|-----------|
+| PostgreSQL (sessions, users, grades, assignments) | `pg_dump` via backup container | Daily |
+| Knowledge bases (`data/knowledge_bases/`) | File copy / rsync | Daily |
+| Workspace files (`data/user/workspace/`) | File copy / rsync | Daily |
+| Settings (`data/user/settings/`) | File copy / rsync | On change |
+| Ollama models (`/root/.ollama/`) | Manual (large, rarely changes) | On update |
+
+**Backup script for school IT staff** (`scripts/school-backup.sh`):
+
+```bash
+#!/bin/bash
+# One-command full backup for school deployments
+BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+
+echo "1/3 Backing up database..."
+docker exec deeptutor-postgres pg_dump -U deeptutor deeptutor | gzip > "$BACKUP_DIR/db.sql.gz"
+
+echo "2/3 Backing up knowledge bases..."
+tar czf "$BACKUP_DIR/knowledge_bases.tar.gz" ./data/knowledge_bases/
+
+echo "3/3 Backing up user data..."
+tar czf "$BACKUP_DIR/user_data.tar.gz" ./data/user/
+
+echo "Backup complete: $BACKUP_DIR"
+ls -lh "$BACKUP_DIR"
+```
+
+**Restore script** (`scripts/school-restore.sh`):
+
+```bash
+#!/bin/bash
+# Restore from a backup directory
+BACKUP_DIR="$1"
+if [ -z "$BACKUP_DIR" ]; then
+    echo "Usage: ./scripts/school-restore.sh ./backups/20260411_020000"
+    exit 1
+fi
+
+echo "WARNING: This will overwrite current data. Press Ctrl+C to cancel."
+read -p "Continue? (y/N) " confirm
+[ "$confirm" = "y" ] || exit 0
+
+echo "1/3 Restoring database..."
+docker exec -i deeptutor-postgres psql -U deeptutor deeptutor < <(gunzip -c "$BACKUP_DIR/db.sql.gz")
+
+echo "2/3 Restoring knowledge bases..."
+tar xzf "$BACKUP_DIR/knowledge_bases.tar.gz"
+
+echo "3/3 Restoring user data..."
+tar xzf "$BACKUP_DIR/user_data.tar.gz"
+
+echo "Restore complete. Restart with: docker compose restart"
+```
+
+##### 3. Application Updates (Zero-Downtime for Schools)
+
+Schools need to update DeepTutor without losing data or causing extended downtime. The update process should be as simple as possible.
+
+**Update workflow for school IT staff:**
+
+```bash
+# Step 1: Pull the new version (or load from USB for offline)
+docker compose -f docker-compose.school.yml pull
+# OR for offline:
+docker load < deeptutor-school-v1.2.0.tar
+
+# Step 2: Auto-backup before update
+./scripts/school-backup.sh
+
+# Step 3: Restart with new version (auto-migrates on startup)
+docker compose -f docker-compose.school.yml up -d
+
+# Step 4: Verify
+docker exec deeptutor alembic current
+docker compose logs --tail=20
+```
+
+**Built-in safety measures:**
+
+| Protection | How |
+|-----------|-----|
+| **Pre-update backup** | `entrypoint.sh` auto-creates a backup before running migrations |
+| **Migration rollback** | If migration fails, container exits cleanly with error log — old data untouched |
+| **Version compatibility check** | App startup checks that DB schema version matches expected version |
+| **Docker volume persistence** | Database and files live in Docker volumes — container replacement doesn't touch them |
+| **Health check** | Docker health check verifies the app is serving requests after restart |
+
+**Version manifest** — each release includes a `version.json`:
+```json
+{
+  "app_version": "1.2.0",
+  "schema_version": "004",
+  "min_upgrade_from": "1.0.0",
+  "release_date": "2026-05-01",
+  "migration_notes": "Adds assignment tables. Auto-migrated on startup."
+}
+```
+
+##### 4. Data Export & Portability
+
+Schools may need to export data for compliance, switching platforms, or parent requests:
+
+**Student data export** (FERPA / GDPR compliance):
+```bash
+# Export a single student's data (for parent request or transfer)
+docker exec deeptutor python -m deeptutor.cli export-student \
+    --student-id stu_12345 \
+    --output /data/exports/student_12345.zip
+
+# Exports: chat history, quiz scores, assignments, learning progress, memory profile
+# Format: JSON + PDF summary
+```
+
+**Full school data export:**
+```bash
+# Export everything for a school (annual archive or platform migration)
+docker exec deeptutor python -m deeptutor.cli export-school \
+    --output /data/exports/school_full.zip
+
+# Exports: all users, all sessions, all assignments, all grades, knowledge bases
+```
+
+**Data retention policy** (configurable per school):
+```yaml
+# In school settings
+data_retention:
+  student_chat_history: 365    # days — auto-delete after 1 year
+  completed_assignments: 730   # days — keep for 2 years
+  quiz_results: 730            # days
+  audit_logs: 1095             # days — 3 years
+  auto_cleanup: true           # run cleanup job weekly
+```
+
+##### 5. Offline Update Distribution
+
+For air-gapped schools, updates are distributed via USB or local network:
+
+```bash
+# On the build server (with internet):
+# 1. Build the new version
+docker compose build
+
+# 2. Package everything into a single update bundle
+./scripts/package-school-update.sh v1.2.0
+
+# Output: deeptutor-update-v1.2.0.tar.gz (~2-5 GB)
+# Contains: Docker images + migration scripts + release notes
+
+# On the school server (no internet):
+# 1. Copy update bundle from USB
+# 2. Run the update script
+./scripts/apply-school-update.sh deeptutor-update-v1.2.0.tar.gz
+
+# The script:
+# - Loads new Docker images
+# - Creates a backup
+# - Restarts with new version
+# - Runs migrations
+# - Verifies health
+# - Prints release notes
+```
+
+##### Summary: Database Lifecycle for Schools
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    School Server                            │
+│                                                             │
+│  ┌─────────────┐    ┌──────────┐    ┌───────────────────┐  │
+│  │  DeepTutor   │───▶│ Postgres │───▶│  Daily Backups    │  │
+│  │  (app)       │    │ (data)   │    │  ./backups/       │  │
+│  └──────┬───────┘    └──────────┘    │  30 days retained │  │
+│         │                            └───────────────────┘  │
+│         │ on startup                                        │
+│         ▼                                                   │
+│  ┌─────────────┐                                            │
+│  │  Alembic     │  Schema versioned, auto-migrates,         │
+│  │  migrations  │  rollback-safe                            │
+│  └─────────────┘                                            │
+│                                                             │
+│  Update: pull new image → auto-backup → auto-migrate → run │
+│  Restore: ./scripts/school-restore.sh ./backups/20260411   │
+│  Export: ./scripts/export-student.sh --student-id stu_123  │
+└─────────────────────────────────────────────────────────────┘
+```
