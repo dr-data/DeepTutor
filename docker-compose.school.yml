@@ -1,0 +1,173 @@
+# ============================================
+# DeepTutor Docker Compose — School Deployment
+# ============================================
+# Self-contained, offline-capable school deployment that bundles:
+#
+#   - DeepTutor (FastAPI backend + Next.js frontend)
+#   - PostgreSQL (multi-user database)
+#   - Ollama (local LLM + embedding runtime, optional GPU)
+#   - Automated daily backups (postgres-backup-local)
+#
+# This stack is designed to run on a single school server with no internet
+# access. All services are pinned to a specific image tag so that an IT
+# administrator can load images from a USB drive and bring the stack up
+# without reaching out to any registry.
+#
+# Usage:
+#   1. Copy .env.school.example to .env.school and fill in secrets.
+#   2. docker compose -f docker-compose.school.yml up -d
+#   3. First-run migrations execute automatically inside the app container.
+#   4. Create the initial admin user via the CLI:
+#        docker exec -it deeptutor-app \
+#            python -m deeptutor_cli.school bootstrap \
+#            --school-name "My High School" \
+#            --admin-email admin@example.edu
+#
+# Offline install:
+#   See docs/secondary-school-features.md § "Offline setup for IT staff"
+#   for the pull → save → load workflow.
+# ============================================
+
+services:
+  # ============================================
+  # PostgreSQL — multi-user database
+  # ============================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: deeptutor-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-deeptutor}
+      - POSTGRES_USER=${POSTGRES_USER:-deeptutor}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.school}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deeptutor} -d ${POSTGRES_DB:-deeptutor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - deeptutor-school
+
+  # ============================================
+  # Ollama — local LLM + embedding runtime
+  # ============================================
+  # Ollama serves both the chat model and the embedding model so the school
+  # is fully independent of any cloud AI API. Uncomment the `deploy` block to
+  # pass through an NVIDIA GPU when one is available — CPU-only works too,
+  # just slower.
+  # ============================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: deeptutor-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    # Uncomment for GPU acceleration (requires nvidia-container-toolkit).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    networks:
+      - deeptutor-school
+
+  # ============================================
+  # DeepTutor application (FastAPI + Next.js)
+  # ============================================
+  deeptutor:
+    image: ${DEEPTUTOR_IMAGE:-ghcr.io/hkuds/deeptutor:latest}
+    container_name: deeptutor-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    ports:
+      - "${BACKEND_PORT:-8001}:${BACKEND_PORT:-8001}"
+      - "${FRONTEND_PORT:-3782}:${FRONTEND_PORT:-3782}"
+    env_file:
+      - .env.school
+    environment:
+      # --------------------------------------------------------------
+      # School mode — enables auth, RBAC, and multi-user middleware
+      # --------------------------------------------------------------
+      - SCHOOL_MODE=true
+      - DEEPTUTOR_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-deeptutor}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-deeptutor}
+      # Alembic uses the psycopg driver for synchronous migrations.
+      - ALEMBIC_DATABASE_URL=postgresql://${POSTGRES_USER:-deeptutor}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-deeptutor}
+      - DEEPTUTOR_JWT_SECRET=${DEEPTUTOR_JWT_SECRET:?DEEPTUTOR_JWT_SECRET must be set in .env.school}
+      - AUTO_MIGRATE_ON_START=true
+      # --------------------------------------------------------------
+      # LLM via Ollama (no internet needed)
+      # --------------------------------------------------------------
+      - LLM_BINDING=ollama
+      - LLM_HOST=http://ollama:11434
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5:14b}
+      - EMBEDDING_BINDING=ollama
+      - EMBEDDING_HOST=http://ollama:11434
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+      - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-768}
+      # --------------------------------------------------------------
+      # Service ports
+      # --------------------------------------------------------------
+      - BACKEND_PORT=${BACKEND_PORT:-8001}
+      - FRONTEND_PORT=${FRONTEND_PORT:-3782}
+      # For remote access: set this to the server's LAN address/hostname.
+      - NEXT_PUBLIC_API_BASE_EXTERNAL=${NEXT_PUBLIC_API_BASE_EXTERNAL:-}
+    volumes:
+      - ./data/user:/app/data/user
+      - ./data/knowledge_bases:/app/data/knowledge_bases
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${BACKEND_PORT:-8001}/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    networks:
+      - deeptutor-school
+
+  # ============================================
+  # Automated PostgreSQL backups
+  # ============================================
+  # Runs pg_dump on a schedule and keeps a rolling window of daily,
+  # weekly, and monthly backups on the host filesystem. School IT staff
+  # can copy ./backups/ to offsite media as needed.
+  # ============================================
+  backup:
+    image: prodrigestivill/postgres-backup-local:16-alpine
+    container_name: deeptutor-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB:-deeptutor}
+      - POSTGRES_USER=${POSTGRES_USER:-deeptutor}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_EXTRA_OPTS=--no-owner --no-privileges
+      - SCHEDULE=${BACKUP_SCHEDULE:-@daily}
+      - BACKUP_KEEP_DAYS=${BACKUP_KEEP_DAYS:-30}
+      - BACKUP_KEEP_WEEKS=${BACKUP_KEEP_WEEKS:-4}
+      - BACKUP_KEEP_MONTHS=${BACKUP_KEEP_MONTHS:-6}
+      - HEALTHCHECK_PORT=8080
+    volumes:
+      - ./backups/postgres:/backups
+    networks:
+      - deeptutor-school
+
+volumes:
+  postgres_data:
+    driver: local
+  ollama_models:
+    driver: local
+
+networks:
+  deeptutor-school:
+    driver: bridge
